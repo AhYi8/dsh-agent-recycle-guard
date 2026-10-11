@@ -1,0 +1,48 @@
+{
+  "name": "dsh-agent-recycle-guard",
+  "version": "1.0.1",
+  "description": "DSH 删除防护插件：拦截 Agent 的 rm/del/Remove-Item 等删除命令并强制转入 Windows 回收站，安装即用、零配置。 · Recycle-bin delete guard for DeepSeek Harness agents — install and go, no config.",
+  "type": "module",
+  "main": "./lib/plugin.js",
+  "scripts": {
+    "prepack": "node scripts/prepack.js"
+  },
+  "exports": {
+    ".": "./lib/plugin.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "guard",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "os": [
+    "win32"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "engines": {
+      "dsh": ">=0.1.7-rc.1"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "recycle-bin",
+    "delete-guard",
+    "safety"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

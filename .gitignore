@@ -1,0 +1,8 @@
+# 运行产物（首运行引导生成，不入库）
+guard/runtime.json
+guard/logs/
+__pycache__/
+
+# npm 打包产物
+*.tgz
+node_modules/

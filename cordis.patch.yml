@@ -1,0 +1,12 @@
+# dsh-agent-recycle-guard 的 bundle patch。
+#
+# DSH 启动时读取本包 package.json 的 dsh.bundle.patch，把下面这条 insert
+# 行插入 Loader 树；行里的 name 是包名，loader 在 profile 的 node_modules 里
+# 解析它并把宿主插件半（main：lib/plugin.js）挂到这一行上。
+#
+# 这里刻意不写 config：python / pwsh / 防护脚本路径全部由插件在运行时
+# 自动探测与自定位，实现“安装即用、零配置”；如确需覆盖 python 路径，
+# 可在 profile 的 cordis.patch.yml 末尾追加同 id 顶层行携带 config。
+- insert:
+    - id: agent-recycle-guard
+      name: dsh-agent-recycle-guard
