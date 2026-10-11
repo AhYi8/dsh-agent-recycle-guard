@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import fnmatch
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -44,23 +45,33 @@ def config():
     # 零配置安装即用：首次运行自动引导 runtime.json 与 recycle.cmd。
     # 机器相关路径（python、pwsh、安装目录、受保护路径）就地探测生成，
     # 之后以既有文件为准，不覆盖用户手工调整。
-    if not SETTINGS.exists():
+    settings = None
+    if SETTINGS.exists():
+        try:
+            settings = json.loads(SETTINGS.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            settings = None
+        # 文件存在但字段不完整（如空对象）时必须重建：不能因文件存在就认定引导完成。
+        if not isinstance(settings, dict) or not all(
+                isinstance(settings.get(k), (str, list)) and settings.get(k) for k in ("python", "pwsh", "install_dir", "protected")):
+            settings = None
+    if settings is None:
         pwsh = shutil.which("pwsh") or shutil.which("powershell")
         if not pwsh:
             raise GuardError("未找到 PowerShell（pwsh/powershell），无法初始化删除防护。")
-        bootstrap = {
+        settings = {
             "python": sys.executable.replace("\\", "/"),
             "pwsh": pwsh.replace("\\", "/"),
             "install_dir": str(ROOT),
             # 默认把整个用户主目录列为受保护路径，与既有安装的防护强度一致。
             "protected": [str(Path.home())],
         }
-        SETTINGS.write_text(json.dumps(bootstrap, ensure_ascii=False, indent=2), encoding="utf-8")
+        SETTINGS.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
         # recycle.cmd 需要真实 python 路径；按当前解释器生成启动器。
         (ROOT / "recycle.cmd").write_bytes(
-            ('@echo off\r\n"' + sys.executable + '" -X utf8 "%~dp0guard.py" recycle --payload "%~1"\r\nexit /b %errorlevel\r\n').encode("utf-8")
+            ('@echo off\r\n"' + sys.executable + '" -X utf8 "%~dp0guard.py" recycle --payload "%~1"\r\nexit /b %errorlevel%\r\n').encode("utf-8")
         )
-    return json.loads(SETTINGS.read_text(encoding="utf-8"))
+    return settings
 
 
 def base_name(name):
@@ -327,8 +338,12 @@ def ps_command_kind(name):
     return "unknown"
 
 
-def rewrite_ps_calls(ast, command, data, key, agent, event):
-    """只替换实际删除调用位置；不注入全局函数，也不执行输入来推测路径。"""
+def replace_ps_deletes(ast, command, event=None):
+    """校验并把文本中的 PowerShell 删除调用替换为回收入口；无删除调用时返回 None。
+
+    同时服务内联命令与 .ps1 脚本内容：只替换实际删除调用位置，
+    不注入全局函数，也不执行输入来推测路径。
+    """
     runner = str(ROOT / "recycle_powershell.ps1").replace("\\", "/")
     sites = ast["commands"]
     trusted = [s for s in sites if s["name"] == runner]
@@ -344,21 +359,267 @@ def rewrite_ps_calls(ast, command, data, key, agent, event):
         canonical = [{"lp": "literalpath", "r": "recurse"}.get(p, p) for p in site["parameters"]]
         if site["splat"] or not set(site["parameters"]) <= allowed or len(canonical) != len(set(canonical)):
             raise GuardError("复杂删除不支持歧义参数、重复参数或参数展开，请使用明确参数名。")
-    if deletes or trusted:
-        resolve_cwd(data.get("workdir", data.get("cwd")), event.get("cwd"))
     if not deletes:
-        # 删除字样仅在数据中出现，或所有删除调用已替换；仍检查整条命令，不能前缀即放行。
-        return {"action": "allow"}
+        return None
+    if event is not None:
+        data = event.get("tool_input", event.get("toolInput", {}))
+        resolve_cwd(data.get("workdir", data.get("cwd")) if isinstance(data, dict) else None, event.get("cwd"))
     # PowerShell 的 Extent 偏移以 UTF-16 为单位，不能直接用 Python 的 Unicode 索引。
     encoded = command.encode("utf-16-le")
     for site in sorted(deletes, key=lambda s: s["start"], reverse=True):
         replacement = ("" if site["invocation"] == "Ampersand" else "& ") + "'" + runner.replace("'", "''") + "'"
         encoded = encoded[:site["start"] * 2] + replacement.encode("utf-16-le") + encoded[site["end"] * 2:]
+    return encoded.decode("utf-16-le")
+
+
+def rewrite_ps_calls(ast, command, data, key, agent, event):
+    """内联命令入口：复用 replace_ps_deletes，产出工具输入级改写决策。"""
+    runner = str(ROOT / "recycle_powershell.ps1").replace("\\", "/")
+    sites = ast["commands"]
+    deletes = [s for s in sites if ps_command_kind(s["name"]) == "delete"]
+    trusted = [s for s in sites if s["name"] == runner]
+    if deletes or trusted:
+        resolve_cwd(data.get("workdir", data.get("cwd")), event.get("cwd"))
+    updated_text = replace_ps_deletes(ast, command)
+    if updated_text is None:
+        # 删除字样仅在数据中出现，或所有删除调用已替换；仍检查整条命令，不能前缀即放行。
+        return {"action": "allow"}
     updated = dict(data)
-    updated[key] = encoded.decode("utf-16-le")
+    updated[key] = updated_text
     if agent == "codex":
         updated["command"] = updated[key]
     return {"action": "rewrite", "input": updated, "reason": "已将实际 PowerShell 文件删除调用替换为回收入口；变量与管道目标在执行时校验。"}
+
+
+SCRIPT_EXTS = {".ps1", ".cmd", ".bat"}
+
+
+def script_target(parts):
+    r"""定位命令中的第一个本地脚本文件引用，返回 (下标, 原始引用) 或 None。
+
+    覆盖三类形态：直接调用 .\cleanup.ps1、powershell -File x.ps1、
+    以及 PowerShell/CMD 中运行 .cmd/.bat 批处理。
+    """
+    if not parts:
+        return None
+    first = parts[0].value.lower()
+    head = base_name(parts[0].value)
+    if head in {"powershell", "pwsh"}:
+        for i, p in enumerate(parts[1:], 1):
+            if p.value.lower() in ("-file", "-f") and i + 1 < len(parts):
+                nxt = parts[i + 1].value.lower()
+                if nxt.endswith(".ps1"):
+                    return i + 1, parts[i + 1].value
+                if nxt.endswith((".cmd", ".bat")):
+                    return i + 1, parts[i + 1].value
+        return None
+    for i, p in enumerate(parts):
+        if p.value.lower().endswith((".cmd", ".bat", ".ps1")):
+            return i, p.value
+    return None
+
+
+QUOTED_SPAN = re.compile(r"'[^'\n]*'|\"[^\"\n]*\"")
+
+
+def collect_script_refs(command):
+    r"""从命令原文收集全部本地脚本引用。
+
+    引号内的整段提取（带空格、方括号的路径如 '.\wipe space.ps1'、
+    '.\syntax-special\[wipe].ps1' 不能被空格/括号拆词破坏）；引号外再按
+    Shell 分隔符扫描，覆盖多语句、条件块、-File/-Command 包装等形态。
+    反引号转义按语义剔除（`wi`pe.ps1` → wipe.ps1）。
+    未加引号却含方括号的路径是 PowerShell 通配符语义，无法证明指向
+    哪个文件，直接拒绝。
+    """
+    refs = []
+
+    def _add(token, quoted):
+        token = token.strip("\"'") if quoted else token
+        if not token or token.startswith("-") or token in refs:
+            return
+        if not quoted and ("[" in token or "]" in token):
+            raise GuardError("未引用的方括号路径是通配符语义，无法确定实际脚本，已拒绝。")
+        if token.lower().endswith((".ps1", ".cmd", ".bat")):
+            refs.append(token)
+
+    unquoted = command.replace("`", "")
+    for span in QUOTED_SPAN.finditer(unquoted):
+        _add(span.group(0), True)
+    stripped = QUOTED_SPAN.sub(" ", unquoted)
+    for token in re.split(r"[\s;|&()\[\]{}]+", stripped):
+        _add(token, False)
+    return refs
+
+
+def resolve_script_ref(ref, cwd, extra_dir=None, dialect="powershell"):
+    """把脚本引用解析为实际执行文件路径；找不到返回 None（交由 Shell 自行报错）。
+
+    按 Shell 的真实查找语义绑定被检查的文件，避免"检查 A、执行 B"：
+    - cmd.exe：当前目录优先（含 PATHEXT 逐个扩展名），再走 PATH；
+    - PowerShell：裸名不搜当前目录，只按 PATH；
+    - 带路径分隔符的引用按会话目录（嵌套时按脚本所在目录）解析。
+    """
+    if not isinstance(ref, str) or not ref or len(ref) > 240 or ".." in re.split(r"[\\/]", ref):
+        raise GuardError("脚本引用为空、过长或包含父目录跳转。")
+    raw = ref.replace("/", "\\")
+    bare = not re.search(r"[\\/]", ref)
+
+    def _existing(joined):
+        path = Path(joined)
+        if path.is_file() and re.match(r"^[A-Za-z]:\\", str(path)):
+            return path
+        return None
+
+    if bare:
+        found = shutil.which(raw)
+        if dialect == "cmd":
+            # cmd.exe 语义：当前目录（PATHEXT 逐个尝试）优先于 PATH。
+            for ext in (".cmd", ".bat", ".ps1"):
+                hit = _existing(os.path.abspath(os.path.join(cwd, raw + ext)))
+                if hit is not None:
+                    return hit
+            if found and re.match(r"^[A-Za-z]:\\", str(Path(found))):
+                return Path(found)
+            return None
+        # PowerShell 裸名不搜当前目录；PATH 找不到时命令本就无法执行。
+        if found and re.match(r"^[A-Za-z]:\\", str(Path(found))):
+            return Path(found)
+        return None
+    candidates = [os.path.abspath(os.path.join(cwd, raw))]
+    if extra_dir is not None:
+        candidates.append(os.path.abspath(os.path.join(extra_dir, raw)))
+    for joined in candidates:
+        hit = _existing(joined)
+        if hit is not None:
+            return hit
+    return None
+
+
+def read_script_content(path):
+    """读取脚本全文；过大或不可读均拒绝（读取失败不能成为放行条件）。"""
+    try:
+        content = path.read_text(encoding="utf-8-sig")
+    except (OSError, ValueError):
+        raise GuardError("无法读取脚本内容以验证删除安全性。")
+    if len(content.encode("utf-8")) > 131072:
+        raise GuardError("脚本过大，无法在检查阶段完整验证。")
+    return content
+
+
+def inspect_script_file(path, cfg, event, script_cwd, depth=0):
+    """对已解析到盘符路径的脚本做静态删除检查。
+
+    .ps1：危险时返回改写后的冻结副本路径（调用方决定改写或拒绝），干净返回 None。
+    .cmd/.bat：剔除 ^ 转义后匹配删除语义，含删除即拒绝（批处理无法安全改写）；
+    嵌套引用其他脚本时递归检查（深度上限 3）。
+    注意：冻结副本仅降低检查与执行之间被篡改的窗口，不能视为完全不可变。
+    """
+    if depth > 3:
+        raise GuardError("脚本嵌套引用超过安全深度。")
+    content = read_script_content(path)
+    ext = path.suffix.lower()
+    runner = str(ROOT / "recycle_powershell.ps1").replace("\\", "/")
+    if ext in (".cmd", ".bat"):
+        # CMD 的 ^ 转义可以拆分关键词（d^el、^ 续行拼接）；先拒绝无法静态
+        # 验证的形态，再按去转义文本匹配删除语义。变量拼接命令名（%a%%b%）、
+        # 延迟展开（!a!）与 ^ 续行无法证明安全，一律拒绝。
+        if re.search(r"\^\s*(?:\r?\n|$)", content):
+            raise GuardError("批处理包含 ^ 续行或行尾转义，无法静态验证，已拒绝执行。")
+        if re.search(r"![A-Za-z_]\w*!", content):
+            raise GuardError("批处理包含延迟展开变量，无法静态验证，已拒绝执行。")
+        plain = content.replace("^", "")
+        if re.search(r"(?im)^\s*@?\s*(?:call\s+)?%[^%\r\n]{1,64}%", plain):
+            raise GuardError("批处理命令名使用变量拼接，无法静态验证，已拒绝执行。")
+        if re.search(r"(?i)\bcall\s+%[^%\r\n]{1,64}%", plain):
+            raise GuardError("批处理 call 目标使用变量拼接，无法静态验证，已拒绝执行。")
+        if OPAQUE.search(plain) or looks_dangerous(plain) or re.search(
+                r"(?i)(?<![\w-])(?:del|erase|rd|rmdir)(?![\w-])", plain):
+            raise GuardError("批处理脚本包含删除或不可静态验证的语义，已拒绝执行；请改写为等价 PowerShell 命令。")
+        for ref in collect_script_refs(plain):
+            nested = resolve_script_ref(ref, script_cwd, path.parent, dialect="cmd")
+            # 嵌套脚本若需要改写（返回冻结副本），批处理无法替换其执行路径，必须拒绝。
+            if nested is not None and ROOT not in nested.parents:
+                if inspect_script_file(nested, cfg, event, script_cwd, depth + 1):
+                    raise GuardError("批处理引用的嵌套脚本包含删除调用，外层无法替换执行副本，已拒绝执行。")
+        return None
+    ast, _ = parse_ps(content, cfg)
+    if ast["dynamic"] or OPAQUE.search(content):
+        raise GuardError("脚本包含动态调用或编码命令，无法验证删除安全性，已拒绝执行。")
+    if ast["errors"]:
+        raise GuardError("脚本存在语法错误，已拒绝执行。")
+    runner = str(ROOT / "recycle_powershell.ps1").replace("\\", "/")
+    danger = looks_dangerous(content) or any(
+        base_name(n) in DELETE_NAMES or base_name(n).startswith("remove-") for n in ast["names"] if n)
+    # 嵌套引用按脚本自身全文收集（覆盖 pwsh -File/-Command 包装、cmd /c、
+    # 直接调用等形态），相对引用按脚本所在目录解析；嵌套需要改写时外层无法
+    # 替换其运行时调用点，只能整体拒绝。
+    for ref in collect_script_refs(content):
+        if runner in ref:
+            continue
+        nested = resolve_script_ref(ref, str(path.parent), dialect="powershell")
+        if nested is not None and ROOT not in nested.parents:
+            if inspect_script_file(nested, cfg, event, script_cwd, depth + 1):
+                raise GuardError("脚本引用的嵌套脚本包含删除调用，外层无法替换执行副本，已拒绝执行；请单独执行该脚本。")
+    if not danger:
+        # 干净脚本不要求改写白名单，$PSScriptRoot 等自身目录引用照常放行。
+        return None
+    if re.search(r"(?i)\$\{?(?:psscriptroot|pscommandpath)\}?", content):
+        # 冻结副本位于防护目录，$PSScriptRoot/$PSCommandPath 语义会改变，无法安全执行。
+        raise GuardError("脚本依赖自身目录（$PSScriptRoot/$PSCommandPath），冻结副本会改变语义，已拒绝执行。")
+    updated = replace_ps_deletes(ast, content, event)
+    if updated is None:
+        raise GuardError("脚本包含删除语义但无法安全改写，已拒绝执行。")
+    # 冻结改写后的内容再执行：分析与执行之间原脚本被改动不影响执行内容。
+    digest = hashlib.sha256(updated.encode("utf-8")).hexdigest()[:16]
+    folder = ROOT / "logs" / "rewritten"
+    folder.mkdir(parents=True, exist_ok=True)
+    frozen = folder / (path.stem + "." + digest + ".ps1")
+    if frozen.exists():
+        frozen.chmod(0o644)
+    # PowerShell 5.1 对无 BOM 脚本按 ANSI 解码，中文路径会变乱码；必须带 BOM 写入。
+    frozen.write_text(updated, encoding="utf-8-sig")
+    frozen.chmod(0o444)
+    return str(frozen).replace("\\", "/")
+
+
+def frozen_replacement(frozen, idx, parts):
+    """构造外层命令中的冻结副本引用：直接调用需 & 前缀，参数位置仅加引号。"""
+    quoted = "'" + frozen.replace("'", "''") + "'"
+    if parts[idx].quoted:
+        return frozen.replace("'", "''")
+    if idx == 0:
+        return "& " + quoted
+    return quoted
+
+
+def inspect_bare_commands(command, cfg, event, script_cwd, dialect):
+    """裸命令名（无扩展名）可能经 PATHEXT/PATH 解析为脚本；逐个探测并检查内容。
+
+    cmd.exe 会对裸名按当前目录+PATHEXT 搜索；PowerShell 裸名走 PATH。
+    解析到含删除调用的脚本时，裸名无法安全替换为冻结副本，直接拒绝。
+    """
+    seen = set()
+    for token in re.split(r"[\s;|&\"'()`\[\]{}]+", command.replace("`", "")):
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,39}", token) or "." in token:
+            continue
+        if token.lower() in seen:
+            continue
+        seen.add(token.lower())
+        targets = []
+        if dialect == "cmd":
+            for ext in (".cmd", ".bat"):
+                candidate = Path(os.path.abspath(os.path.join(script_cwd, token + ext)))
+                if candidate.is_file():
+                    targets.append(candidate)
+        found = shutil.which(token)
+        if found and Path(found).suffix.lower() in (".cmd", ".bat", ".ps1"):
+            targets.append(Path(found))
+        for target in targets:
+            if ROOT in target.parents:
+                continue
+            if inspect_script_file(target, cfg, event, script_cwd):
+                raise GuardError("裸命令名解析到包含删除调用的脚本，无法安全替换执行副本，已拒绝；请用显式路径单独执行。")
 
 
 def analyze(event, agent, cfg):
@@ -398,6 +659,40 @@ def analyze(event, agent, cfg):
         wrapped = runner in ast["names"]
         if ast["dynamic"] or OPAQUE.search(command):
             raise GuardError("动态命令名无法证明安全，已阻止调用。")
+        # 脚本拦截：全文扫描命令中的本地 .ps1/.cmd/.bat 引用（覆盖多语句、
+        # 条件块、-File/-Command 包装等复杂外层），读取内容逐个检查。
+        refs = collect_script_refs(command)
+        if refs:
+            script_cwd = resolve_cwd(data.get("workdir", data.get("cwd")), event.get("cwd"))
+            hit = script_target(parts) if parts else None
+            for ref in refs:
+                resolved = resolve_script_ref(ref, script_cwd)
+                # 防护目录内文件（回收入口/已改写的冻结副本）与不存在的引用跳过
+                # 内容检查（后者由 Shell 报错）。
+                if resolved is None or ROOT in resolved.parents:
+                    continue
+                frozen = inspect_script_file(resolved, cfg, event, script_cwd)
+                if not frozen:
+                    continue
+                # 只有“单条命令、调用位置（直接执行或 -File/-f 包装）、引用可在原文中
+                # 字面定位”才改写执行冻结副本；参数位置（Get-Content/Copy-Item 等会改变
+                # 读取或复制语义）、复杂外层、反引号转义名一律拒绝，
+                # 避免字符串替换找不到目标导致的重复改写循环。
+                invoked = hit is not None and (hit[0] == 0 or (
+                    base_name(parts[0].value) in {"powershell", "pwsh"}
+                    and hit[0] >= 2 and parts[hit[0] - 1].value.lower() in ("-file", "-f")))
+                replaceable = invoked and hit[1] == ref and ref in command
+                if not replaceable:
+                    raise GuardError("命令引用的脚本包含删除调用，当前上下文无法安全改写，已拒绝；请单独执行该脚本。")
+                updated = dict(data)
+                updated[key] = command.replace(ref, frozen_replacement(frozen, hit[0], parts), 1)
+                if updated[key] == command:
+                    raise GuardError("脚本改写未能改变原命令，已拒绝执行。")
+                if agent == "codex":
+                    updated["command"] = updated[key]
+                return {"action": "rewrite", "input": updated, "reason": "脚本包含删除调用，已替换为删除改写后的冻结副本执行；原脚本不会被直接执行。"}
+        # 裸命令名经 PATHEXT/PATH 可能解析为脚本，同样需要内容检查。
+        inspect_bare_commands(command, cfg, event, resolve_cwd(data.get("workdir", data.get("cwd")), event.get("cwd")), "powershell")
         if not danger and not wrapped:
             return {"action": "allow"}
         if ast["errors"]:
@@ -407,6 +702,20 @@ def analyze(event, agent, cfg):
     else:
         if OPAQUE.search(command):
             raise GuardError("动态执行或编码命令无法核实删除语义，已阻止。")
+        # 脚本拦截（CMD/Bash 方言）：全文扫描脚本引用并检查内容；
+        # 此方言下不做冻结改写（批处理无法安全改写），危险即整体拒绝。
+        refs = collect_script_refs(command)
+        if refs:
+            script_cwd = resolve_cwd(data.get("workdir", data.get("cwd")), event.get("cwd"))
+            for ref in refs:
+                resolved = resolve_script_ref(ref, script_cwd, dialect=dialect)
+                if resolved is None or ROOT in resolved.parents:
+                    continue
+                # 此方言下不做冻结改写（批处理无法安全改写）；嵌套脚本需要改写时
+                # 外层无法替换其执行路径，必须拒绝而非丢弃检查结果。
+                if inspect_script_file(resolved, cfg, event, script_cwd):
+                    raise GuardError("命令引用的脚本包含删除调用，此 Shell 下无法改写执行副本，已拒绝；请单独执行该脚本。")
+        inspect_bare_commands(command, cfg, event, resolve_cwd(data.get("workdir", data.get("cwd")), event.get("cwd")), dialect)
         if not danger:
             return {"action": "allow"}
         parts = parse_literal(command, dialect)
