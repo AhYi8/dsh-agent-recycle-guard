@@ -1,0 +1,10 @@
+[run]
+source = guard
+patch = subprocess
+relative_files = True
+[paths]
+guard =
+    guard
+    */guard
+[report]
+show_missing = True
